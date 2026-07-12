@@ -5,6 +5,6 @@
 ##  Быстрый старт
 
 ```bash
-git clone https://github.com/USERNAME/armbian-webos.git
+git clone https://github.com/confing-sys/py_OS
 cd armbian-webos
 python armbian_webos.py
