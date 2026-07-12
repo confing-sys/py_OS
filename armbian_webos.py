@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-Armbian WebOS Terminal — симуляция ОС на Python с реальным OTA‑обновлением и реальным APT.
-Кроссплатформенная версия (Windows / Linux / macOS)
+Armbian WebOS Terminal — реальная ФС (песочница), OTA, apt, Desktop Environment.
+Кроссплатформенная (Windows / Linux / macOS).
 """
 
 import os
 import sys
 import shutil
 import subprocess
-import urllib.request
-import urllib.error
+import time
+import ssl
 from datetime import datetime
 from pathlib import Path
+
+# ---------- библиотека для надёжных HTTP-запросов ----------
+try:
+    import requests
+except ImportError:
+    print("Установите библиотеку requests: pip install requests")
+    sys.exit(1)
 
 # ---------- кросс‑платформенный readline ----------
 try:
@@ -23,120 +30,81 @@ except ImportError:
         readline = None
         print("Предупреждение: история команд недоступна (установите pyreadline3 на Windows)")
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 USER = "armbian"
 HOSTNAME = "armbian-pc"
 
 UPDATE_URL = "https://raw.githubusercontent.com/confing-sys/py_OS/main/armbian_webos.py"
 VERSION_URL = "https://raw.githubusercontent.com/confing-sys/py_OS/main/version.txt"
 
-# ─── Виртуальная файловая система (в памяти) ──────────────────────
-fs = {
-    "/": {
-        "type": "dir",
-        "children": {
-            "bin": {"type": "dir", "children": {}},
-            "boot": {"type": "dir", "children": {}},
-            "dev": {"type": "dir", "children": {}},
-            "etc": {
-                "type": "dir",
-                "children": {
-                    "hostname": {"type": "file", "content": HOSTNAME},
-                    "passwd": {"type": "file", "content": "root:x:0:0:root:/root:/bin/bash\narmbian:x:1000:1000::/home/armbian:/bin/bash"},
-                },
-            },
-            "home": {
-                "type": "dir",
-                "children": {
-                    "armbian": {
-                        "type": "dir",
-                        "children": {
-                            ".bashrc": {"type": "file", "content": "export PS1='\\u@\\h:\\w$ '"},
-                            "documents": {
-                                "type": "dir",
-                                "children": {
-                                    "readme.txt": {"type": "file", "content": "Добро пожаловать в Armbian WebOS!\nИспользуйте help для списка команд.\nOTA‑обновление: ota-update"},
-                                    "notes.txt": {"type": "file", "content": "Купить молоко\nПозвонить маме\n"},
-                                },
-                            },
-                            "downloads": {"type": "dir", "children": {}},
-                            "music": {"type": "dir", "children": {}},
-                        }
-                    }
-                },
-            },
-            "media": {"type": "dir", "children": {}},
-            "mnt": {"type": "dir", "children": {}},
-            "opt": {"type": "dir", "children": {}},
-            "proc": {"type": "dir", "children": {}},
-            "root": {"type": "dir", "children": {}},
-            "run": {"type": "dir", "children": {}},
-            "srv": {"type": "dir", "children": {}},
-            "sys": {"type": "dir", "children": {}},
-            "tmp": {"type": "dir", "children": {}},
-            "usr": {"type": "dir", "children": {}},
-            "var": {"type": "dir", "children": {}},
-        },
-    }
-}
+# ─── Настройка песочницы (реальная файловая система) ─────────────
+SANDBOX = os.path.join(os.path.expanduser("~"), "armbian_os")
+os.makedirs(SANDBOX, exist_ok=True)
+cwd_real = [SANDBOX]  # текущий путь внутри песочницы (список)
 
-cwd = ["/", "home", "armbian"]
+# ─── Вспомогательные функции для реальной ФС ─────────────────────
+def get_real_path(path_list):
+    return os.path.join(*path_list)
 
-# ─── Вспомогательные функции ──────────────────────────────────────
-def get_node(path_list):
-    node = fs
-    for part in path_list:
-        if node["type"] != "dir" or part not in node["children"]:
-            return None
-        node = node["children"][part]
-    return node
-
-def get_cwd_node():
-    return get_node(cwd)
-
-def path_to_str(path_list):
-    if path_list == ["/"]:
+def real_path_to_virtual(abs_path):
+    rel = os.path.relpath(abs_path, SANDBOX)
+    if rel == ".":
         return "/"
-    return "/" + "/".join(path_list[1:])
+    return "/" + rel.replace("\\", "/")
+
+def virtual_path_to_real(virt_path):
+    if virt_path == "/":
+        return SANDBOX
+    parts = virt_path.strip("/").split("/")
+    return os.path.normpath(os.path.join(SANDBOX, *parts))
+
+def get_cwd_real():
+    return get_real_path(cwd_real)
 
 def resolve_path(input_str):
     if not input_str.strip():
-        return cwd.copy()
-    parts = input_str.split("/")
+        return get_cwd_real()
     if input_str.startswith("/"):
-        resolved = ["/"]
-        parts = input_str[1:].split("/")
+        target = virtual_path_to_real(input_str)
     elif input_str.startswith("~"):
-        resolved = ["/", "home", "armbian"]
-        if len(input_str) > 1 and input_str[1] == "/":
-            parts = input_str[2:].split("/")
+        home_real = os.path.join(SANDBOX, "home", "armbian")
+        if input_str == "~":
+            target = home_real
         else:
-            parts = input_str[1:].split("/")
+            rest = input_str[2:] if input_str.startswith("~/") else input_str[1:]
+            target = os.path.normpath(os.path.join(home_real, rest.lstrip("/")))
     else:
-        resolved = cwd.copy()
-        parts = input_str.split("/")
-    for part in parts:
-        if part == "" or part == ".":
-            continue
-        elif part == "..":
-            if len(resolved) > 1:
-                resolved.pop()
-        else:
-            resolved.append(part)
-    return resolved
-
-def parent_path(path_list):
-    if len(path_list) <= 1:
-        return ["/"]
-    return path_list[:-1]
+        target = os.path.normpath(os.path.join(get_cwd_real(), input_str))
+    # защита от выхода за пределы песочницы
+    common = os.path.commonpath([os.path.abspath(target), os.path.abspath(SANDBOX)])
+    if common != os.path.abspath(SANDBOX):
+        target = SANDBOX
+    return target
 
 def prompt():
-    p = path_to_str(cwd).replace("/home/armbian", "~")
-    return f"{USER}@{HOSTNAME}:{p}$ "
+    cwd_virt = real_path_to_virtual(get_cwd_real())
+    if cwd_virt.startswith("/home/armbian"):
+        cwd_virt = "~" + cwd_virt[len("/home/armbian"):]
+    elif cwd_virt == "/home/armbian":
+        cwd_virt = "~"
+    return f"{USER}@{HOSTNAME}:{cwd_virt}$ "
 
-# ─── Команды (реализованы полностью) ─────────────────────────────
+def change_dir(target_real):
+    if os.path.isdir(target_real):
+        cwd_real.clear()
+        rel = os.path.relpath(target_real, SANDBOX)
+        if rel == ".":
+            cwd_real.append(SANDBOX)
+        else:
+            parts = rel.split(os.sep)
+            new_path = [SANDBOX] + parts
+            cwd_real.extend(new_path)
+    else:
+        print("cd: нет такого каталога")
+
+# ─── Команды ─────────────────────────────────────────────────────
 def cmd_help(args):
-    print("Доступные команды Armbian WebOS:")
+    print("Доступные команды Armbian WebOS (реальная ФС):")
     cmds = [
         "help", "man <cmd>", "ls [-la]", "cd", "pwd", "cat", "touch", "mkdir", "rm [-r]",
         "cp", "mv", "echo", "grep", "chmod", "whoami", "hostname", "date", "cal",
@@ -146,6 +114,8 @@ def cmd_help(args):
         "─── Пакеты ───", "apt update/upgrade/install", "dpkg", "armbian-config",
         "─── Обработка ───", "head", "tail", "wc", "sort", "uniq", "diff", "tar", "gzip",
         "─── Сервисы ───", "systemctl", "journalctl", "timedatectl",
+        "─── GUI ───", "de / desktop / startx — текстовый рабочий стол",
+        "               mc — файловый менеджер", "calc — калькулятор",
         "─── Обновление ───", "ota-update — реальное OTA обновление"
     ]
     for c in cmds:
@@ -154,9 +124,11 @@ def cmd_help(args):
 def cmd_man(args):
     manuals = {
         "ls": "ls - список файлов и папок.",
-        "nano": "nano - встроенный текстовый редактор.",
-        "apt": "apt - менеджер пакетов (реальный или симуляция).",
-        "ota-update": "ota-update - проверить и установить обновление системы.",
+        "nano": "nano - текстовый редактор.",
+        "apt": "apt - менеджер пакетов (реальный через WSL).",
+        "de": "de / desktop / startx - текстовый рабочий стол с меню.",
+        "mc": "mc - двухпанельный файловый менеджер.",
+        "ota-update": "ota-update - обновление скрипта.",
     }
     cmd = args[0] if args else ""
     print(manuals.get(cmd, f"Нет руководства для '{cmd}'."))
@@ -165,89 +137,87 @@ def cmd_ls(args):
     long_format = "-l" in args
     show_all = "-a" in args
     path_arg = next((a for a in args if not a.startswith("-")), None)
-    target = resolve_path(path_arg) if path_arg else cwd
-    node = get_node(target)
-    if not node or node["type"] != "dir":
+    target = resolve_path(path_arg) if path_arg else get_cwd_real()
+    if not os.path.isdir(target):
         print("ls: нет такого каталога")
         return
-    entries = list(node["children"].items())
+    entries = os.listdir(target)
     if not show_all:
-        entries = [(n, v) for n, v in entries if not n.startswith(".")]
-    entries.sort(key=lambda x: (x[1]["type"] != "dir", x[0]))
+        entries = [e for e in entries if not e.startswith(".")]
+    dirs = []
+    files = []
+    for e in entries:
+        full = os.path.join(target, e)
+        if os.path.isdir(full):
+            dirs.append(e)
+        else:
+            files.append(e)
+    dirs.sort()
+    files.sort()
+    sorted_entries = [(d, True) for d in dirs] + [(f, False) for f in files]
     if long_format:
-        for name, n in entries:
-            perms = "drwxr-xr-x" if n["type"] == "dir" else "-rw-r--r--"
-            size = len(n.get("content", "")) if n["type"] == "file" else 0
-            print(f"{perms} 1 {USER} {USER} {size:>6} {name}")
+        for name, is_dir in sorted_entries:
+            full = os.path.join(target, name)
+            if is_dir:
+                print(f"drwxr-xr-x 1 {USER} {USER}          0 {name}")
+            else:
+                size = os.path.getsize(full)
+                print(f"-rw-r--r-- 1 {USER} {USER} {size:>10} {name}")
     else:
         line = []
-        for name, n in entries:
-            if n["type"] == "dir":
-                line.append(f"\033[94m{name}\033[0m" if os.name != 'nt' else name)
+        for name, is_dir in sorted_entries:
+            if is_dir:
+                line.append(f"\033[94m{name}\033[0m" if os.name != 'nt' else name + "/")
             else:
                 line.append(name)
         print("  ".join(line) if line else "")
 
 def cmd_cd(args):
     if not args:
-        cwd.clear()
-        cwd.extend(["/", "home", "armbian"])
-        return
-    target = resolve_path(args[0])
-    node = get_node(target)
-    if not node:
-        print(f"cd: '{args[0]}' не существует")
-    elif node["type"] != "dir":
-        print(f"cd: '{args[0]}' не каталог")
+        target = os.path.join(SANDBOX, "home", "armbian")
     else:
-        cwd.clear()
-        cwd.extend(target)
+        target = resolve_path(args[0])
+    change_dir(target)
 
 def cmd_pwd(args):
-    print(path_to_str(cwd))
+    print(real_path_to_virtual(get_cwd_real()))
 
 def cmd_cat(args):
     if not args:
         print("cat: требуется имя файла")
         return
-    path = resolve_path(args[0])
-    node = get_node(path)
-    if not node:
+    target = resolve_path(args[0])
+    if not os.path.exists(target):
         print(f"cat: {args[0]}: нет такого файла")
-    elif node["type"] == "dir":
+    elif os.path.isdir(target):
         print(f"cat: {args[0]}: это каталог")
     else:
-        print(node.get("content", ""))
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                print(f.read())
+        except Exception as e:
+            print(f"cat: ошибка чтения: {e}")
 
 def cmd_touch(args):
     if not args:
         print("touch: требуется имя файла")
         return
-    path = resolve_path(args[0])
-    parent = get_node(parent_path(path))
-    name = path[-1]
-    if not parent or parent["type"] != "dir":
+    target = resolve_path(args[0])
+    parent = os.path.dirname(target)
+    if not os.path.isdir(parent):
         print("touch: неверный путь")
         return
-    if name not in parent["children"]:
-        parent["children"][name] = {"type": "file", "content": ""}
-    else:
-        print(f"touch: файл '{name}' уже существует (обновлён)")
+    Path(target).touch()
 
 def cmd_mkdir(args):
     if not args:
         print("mkdir: требуется имя каталога")
         return
-    path = resolve_path(args[0])
-    parent = get_node(parent_path(path))
-    name = path[-1]
-    if not parent or parent["type"] != "dir":
-        print("mkdir: неверный путь")
-        return
-    if name in parent["children"]:
-        print(f"mkdir: '{name}' уже существует")
-    else:
-        parent["children"][name] = {"type": "dir", "children": {}}
+    target = resolve_path(args[0])
+    try:
+        os.makedirs(target, exist_ok=True)
+    except Exception as e:
+        print(f"mkdir: ошибка: {e}")
 
 def cmd_rm(args):
     recursive = "-r" in args or "-rf" in args
@@ -255,16 +225,20 @@ def cmd_rm(args):
     if not targets:
         print("rm: требуется имя файла/каталога")
         return
-    path = resolve_path(targets[0])
-    parent = get_node(parent_path(path))
-    name = path[-1]
-    if not parent or name not in parent["children"]:
+    target = resolve_path(targets[0])
+    if not os.path.exists(target):
         print(f"rm: '{targets[0]}' не найден")
         return
-    if parent["children"][name]["type"] == "dir" and not recursive:
+    if os.path.isdir(target) and not recursive:
         print("rm: невозможно удалить каталог без -r")
         return
-    del parent["children"][name]
+    try:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        else:
+            os.remove(target)
+    except Exception as e:
+        print(f"rm: ошибка: {e}")
 
 def cmd_cp(args):
     if len(args) < 2:
@@ -272,19 +246,16 @@ def cmd_cp(args):
         return
     src = resolve_path(args[0])
     dst = resolve_path(args[1])
-    src_node = get_node(src)
-    if not src_node:
+    if not os.path.exists(src):
         print(f"cp: '{args[0]}' не найден")
         return
-    if src_node["type"] == "dir":
+    if os.path.isdir(src):
         print("cp: пропуск каталога (без -r)")
         return
-    dst_parent = get_node(parent_path(dst))
-    if not dst_parent or dst_parent["type"] != "dir":
-        print("cp: неверный путь назначения")
-        return
-    dst_name = dst[-1]
-    dst_parent["children"][dst_name] = {"type": "file", "content": src_node.get("content", "")}
+    try:
+        shutil.copy2(src, dst)
+    except Exception as e:
+        print(f"cp: ошибка: {e}")
 
 def cmd_mv(args):
     if len(args) < 2:
@@ -292,18 +263,13 @@ def cmd_mv(args):
         return
     src = resolve_path(args[0])
     dst = resolve_path(args[1])
-    src_node = get_node(src)
-    if not src_node:
+    if not os.path.exists(src):
         print(f"mv: '{args[0]}' не найден")
         return
-    dst_parent = get_node(parent_path(dst))
-    if not dst_parent or dst_parent["type"] != "dir":
-        print("mv: неверный путь назначения")
-        return
-    dst_name = dst[-1]
-    dst_parent["children"][dst_name] = src_node
-    src_parent = get_node(parent_path(src))
-    del src_parent["children"][src[-1]]
+    try:
+        shutil.move(src, dst)
+    except Exception as e:
+        print(f"mv: ошибка: {e}")
 
 def cmd_echo(args):
     text = " ".join(args)
@@ -311,9 +277,13 @@ def cmd_echo(args):
         parts = text.split(">")
         content = parts[0].strip()
         file_path = resolve_path(parts[1].strip())
-        parent = get_node(parent_path(file_path))
-        if parent and parent["type"] == "dir":
-            parent["children"][file_path[-1]] = {"type": "file", "content": content}
+        parent = os.path.dirname(file_path)
+        if os.path.isdir(parent):
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception as e:
+                print(f"echo: ошибка записи: {e}")
         else:
             print("echo: ошибка записи")
     else:
@@ -324,14 +294,17 @@ def cmd_grep(args):
         print("grep: требуется шаблон и файл")
         return
     pattern, file_arg = args[0], args[1]
-    path = resolve_path(file_arg)
-    node = get_node(path)
-    if not node or node["type"] != "file":
+    target = resolve_path(file_arg)
+    if not os.path.isfile(target):
         print(f"grep: {file_arg}: нет такого файла")
         return
-    for i, line in enumerate(node.get("content", "").splitlines(), 1):
-        if pattern in line:
-            print(f"{i}:{line}")
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                if pattern in line:
+                    print(f"{i}:{line.rstrip()}")
+    except Exception as e:
+        print(f"grep: ошибка: {e}")
 
 def cmd_chmod(args):
     if args:
@@ -373,36 +346,59 @@ def cmd_nano(args):
     if not args:
         print("nano: укажите имя файла")
         return
-    path = resolve_path(args[0])
-    node = get_node(path)
-    if node and node["type"] == "dir":
+    target = resolve_path(args[0])
+    if os.path.isdir(target):
         print(f"nano: {args[0]}: это каталог")
         return
-    content = node.get("content", "") if node else ""
-    print(f"Редактирование: {path_to_str(path)}")
-    print("Вводите строки (пустая строка + Enter завершает, ':q' выход без сохранения)")
-    lines = content.splitlines()
-    for idx, line in enumerate(lines):
-        print(f"{idx+1}: {line}")
-    new_lines = []
-    while True:
+    content = ""
+    if os.path.isfile(target):
         try:
-            line = input()
-        except EOFError:
-            break
-        if line == "":
-            break
-        if line == ":q":
-            print("Отмена сохранения")
-            return
-        new_lines.append(line)
+            with open(target, "r", encoding="utf-8") as f:
+                content = f.read()
+        except:
+            pass
+    print(f"Редактирование: {real_path_to_virtual(target)}")
+    print("Вводите строки (пустая строка + Enter завершает, Ctrl+C для выхода, ':q' выход без сохранения)")
+    if content:
+        for idx, line in enumerate(content.splitlines(), 1):
+            print(f"{idx}: {line}")
+    new_lines = []
+    try:
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line == "":
+                break
+            if line == ":q":
+                print("Отмена сохранения")
+                return
+            new_lines.append(line)
+    except KeyboardInterrupt:
+        print()
+        if new_lines:
+            ans = input("Сохранить изменения перед выходом? (y/N): ").strip().lower()
+            if ans == 'y':
+                try:
+                    with open(target, "w", encoding="utf-8") as f:
+                        f.write("\n".join(new_lines))
+                    print(f"Файл '{args[0]}' сохранён")
+                except Exception as e:
+                    print(f"Ошибка сохранения: {e}")
+            else:
+                print("Изменения не сохранены.")
+        else:
+            print("Нет изменений для сохранения.")
+        return
+
     new_content = "\n".join(new_lines)
-    parent = get_node(parent_path(path))
-    if parent and parent["type"] == "dir":
-        parent["children"][path[-1]] = {"type": "file", "content": new_content}
+    try:
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(new_content)
         print(f"Файл '{args[0]}' сохранён")
-    else:
-        print("Ошибка сохранения")
+    except Exception as e:
+        print(f"Ошибка сохранения: {e}")
 
 def cmd_exit(args):
     print("Выход из оболочки...")
@@ -412,7 +408,7 @@ def cmd_shutdown(args):
     print("Система останавливается...")
     sys.exit(0)
 
-# ─── Сетевые команды ──────────────────────────────────────────────
+# ─── Сетевые команды (эмуляция) ──────────────────────────────────
 def cmd_ifconfig(args):
     print("eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500")
     print("        inet 192.168.1.42  netmask 255.255.255.0  broadcast 192.168.1.255")
@@ -455,7 +451,7 @@ def cmd_curl(args):
         return
     print("<html><body><h1>Armbian WebOS</h1></body></html>")
 
-# ─── Системные команды ────────────────────────────────────────────
+# ─── Системные команды (эмуляция) ────────────────────────────────
 def cmd_top(args):
     print("top - 12:34:56 up 2:15,  1 user,  load average: 0.08, 0.03, 0.01")
     print("Tasks:  42 total,   1 running,  41 sleeping,   0 stopped,   0 zombie")
@@ -494,7 +490,7 @@ def cmd_dmesg(args):
     print("[    0.000000] Booting Linux on physical CPU 0x0")
     print("[    0.000000] Linux version 5.15.93-armbian ...")
 
-# ─── Пакетный менеджер (реальный + симуляция) ────────────────────
+# ─── Пакетный менеджер (реальный через WSL) ──────────────────────
 def cmd_apt(args):
     apt_path = shutil.which("apt")
     use_sudo = (os.name == 'posix' and os.geteuid() != 0)
@@ -511,7 +507,7 @@ def cmd_apt(args):
     if os.name == 'nt':
         wsl = shutil.which("wsl")
         if wsl:
-            subprocess.run(["wsl", "apt"] + args, check=False)
+            subprocess.run(["wsl", "sudo", "apt"] + args, check=False)
             return
         print("apt недоступен в Windows без WSL.")
         print("  Установите WSL или используйте winget.")
@@ -541,58 +537,86 @@ def cmd_armbian_config(args):
     print("Armbian-config (симуляция): системные настройки, сеть, обновление.")
     print("Используйте ota-update для обновления прошивки.")
 
-# ─── Обработка текста ─────────────────────────────────────────────
+# ─── Обработка текста (реальные файлы) ───────────────────────────
 def cmd_head(args):
     if not args:
         return
-    node = get_node(resolve_path(args[0]))
-    if node and node["type"] == "file":
-        print("\n".join(node.get("content", "").splitlines()[:10]))
+    target = resolve_path(args[0])
+    if os.path.isfile(target):
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = f.readlines()[:10]
+                for line in lines:
+                    print(line.rstrip())
+        except Exception as e:
+            print(f"head: ошибка: {e}")
 
 def cmd_tail(args):
     if not args:
         return
-    node = get_node(resolve_path(args[0]))
-    if node and node["type"] == "file":
-        print("\n".join(node.get("content", "").splitlines()[-10:]))
+    target = resolve_path(args[0])
+    if os.path.isfile(target):
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-10:]
+                for line in lines:
+                    print(line.rstrip())
+        except Exception as e:
+            print(f"tail: ошибка: {e}")
 
 def cmd_wc(args):
     if not args:
         return
-    node = get_node(resolve_path(args[0]))
-    if node and node["type"] == "file":
-        lines = node.get("content", "").splitlines()
-        print(f"{len(lines)} строк")
+    target = resolve_path(args[0])
+    if os.path.isfile(target):
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                count = sum(1 for _ in f)
+            print(f"{count} строк")
+        except Exception as e:
+            print(f"wc: ошибка: {e}")
 
 def cmd_sort(args):
     if not args:
         return
-    node = get_node(resolve_path(args[0]))
-    if node and node["type"] == "file":
-        print("\n".join(sorted(node.get("content", "").splitlines())))
+    target = resolve_path(args[0])
+    if os.path.isfile(target):
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                lines = sorted(line.rstrip() for line in f)
+            print("\n".join(lines))
+        except Exception as e:
+            print(f"sort: ошибка: {e}")
 
 def cmd_uniq(args):
     if not args:
         return
-    node = get_node(resolve_path(args[0]))
-    if node and node["type"] == "file":
-        seen = set()
-        for line in node.get("content", "").splitlines():
-            if line not in seen:
-                print(line)
-                seen.add(line)
+    target = resolve_path(args[0])
+    if os.path.isfile(target):
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                seen = set()
+                for line in f:
+                    line = line.rstrip()
+                    if line not in seen:
+                        print(line)
+                        seen.add(line)
+        except Exception as e:
+            print(f"uniq: ошибка: {e}")
 
 def cmd_diff(args):
     if len(args) < 2:
-        print("diff: два файла")
+        print("diff: требуется два файла")
         return
-    a = get_node(resolve_path(args[0]))
-    b = get_node(resolve_path(args[1]))
-    if a and b and a["type"] == "file" and b["type"] == "file":
-        if a["content"] != b["content"]:
-            print("(файлы различаются)")
-        else:
-            print("(файлы идентичны)")
+    a = resolve_path(args[0])
+    b = resolve_path(args[1])
+    if os.path.isfile(a) and os.path.isfile(b):
+        import difflib
+        with open(a, "r", encoding="utf-8") as fa, open(b, "r", encoding="utf-8") as fb:
+            diff = difflib.unified_diff(fa.readlines(), fb.readlines(), fromfile=args[0], tofile=args[1])
+            sys.stdout.writelines(diff)
+    else:
+        print("diff: оба аргумента должны быть файлами")
 
 def cmd_tar(args):
     print("tar: симуляция архивации (создан архив.tar)")
@@ -600,7 +624,7 @@ def cmd_tar(args):
 def cmd_gzip(args):
     print("gzip: симуляция сжатия")
 
-# ─── Сервисы ──────────────────────────────────────────────────────
+# ─── Сервисы (эмуляция) ─────────────────────────────────────────
 def cmd_systemctl(args):
     if "status" in args:
         print("● armbian-ota.service - OTA Update Service")
@@ -613,36 +637,241 @@ def cmd_journalctl(args):
 def cmd_timedatectl(args):
     print(datetime.now().strftime("Local time: %a %Y-%m-%d %H:%M:%S %Z"))
 
-# ─── OTA-обновление ──────────────────────────────────────────────
+# ─── Псевдо‑рабочий стол и файловый менеджер ────────────────────
+def cmd_de(args):
+    """Текстовый рабочий стол с меню."""
+    print("\n" * 2)
+    print("╔══════════════════════════════════════════╗")
+    print("║        Armbian Desktop Environment       ║")
+    print("╠══════════════════════════════════════════╣")
+    print("║                                          ║")
+    print("║   📁 File Manager       (mc)            ║")
+    print("║   📝 Text Editor        (nano)          ║")
+    print("║   🧮 Calculator         (calc)          ║")
+    print("║   💻 Terminal           (back)          ║")
+    print("║   ⏻  Shutdown           (shutdown)      ║")
+    print("║                                          ║")
+    print("╚══════════════════════════════════════════╝")
+    print("\nИспользуйте стрелки ↑↓ и Enter для выбора, Esc для выхода")
+
+    items = [
+        ("File Manager", "mc"),
+        ("Text Editor", "nano "),
+        ("Calculator", "calc"),
+        ("Terminal", ""),
+        ("Shutdown", "shutdown"),
+    ]
+    current = 0
+    if os.name != 'nt':
+        import tty, termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                sys.stdout.write("\033[2J\033[H")
+                print("╔══════════════════════════════════════════╗")
+                print("║        Armbian Desktop Environment       ║")
+                print("╠══════════════════════════════════════════╣")
+                print("║                                          ║")
+                for i, (label, _) in enumerate(items):
+                    if i == current:
+                        print(f"║  \033[7m {label:37} \033[0m  ║")
+                    else:
+                        print(f"║   {label:37}   ║")
+                print("║                                          ║")
+                print("╚══════════════════════════════════════════╝")
+                sys.stdout.flush()
+                key = sys.stdin.read(1)
+                if key == '\x1b':
+                    next1, next2 = sys.stdin.read(2)
+                    if next1 == '[':
+                        if next2 == 'A':
+                            current = (current - 1) % len(items)
+                        elif next2 == 'B':
+                            current = (current + 1) % len(items)
+                elif key == '\r':
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    chosen_cmd = items[current][1]
+                    if chosen_cmd:
+                        if chosen_cmd == "shutdown":
+                            cmd_shutdown([])
+                        elif chosen_cmd == "mc":
+                            cmd_mc([])
+                        else:
+                            if chosen_cmd == "nano ":
+                                filename = input("Введите имя файла: ")
+                                cmd_nano([filename])
+                            elif chosen_cmd == "calc":
+                                cmd_calc([])
+                    break
+                elif key == '\x1b':
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    break
+        except:
+            pass
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            print("\nРабочий стол закрыт.")
+    else:
+        print("\n(Интерактивное меню недоступно на Windows без дополнительных модулей)")
+        print("Выполните 'mc', 'nano <file>', 'calc' или 'shutdown' вручную.")
+
+def cmd_mc(args):
+    """Простой двухпанельный файловый менеджер (упрощённый)."""
+    left_path = get_cwd_real()
+    right_path = get_cwd_real()
+
+    def show_panels():
+        print("\n" + "="*80)
+        print(f"{'Left':<38} │ {'Right':>38}")
+        print("="*80)
+        left_items = os.listdir(left_path) if os.path.isdir(left_path) else []
+        right_items = os.listdir(right_path) if os.path.isdir(right_path) else []
+        max_lines = max(len(left_items), len(right_items), 20)
+        for i in range(max_lines):
+            left = left_items[i] if i < len(left_items) else ""
+            right = right_items[i] if i < len(right_items) else ""
+            print(f"{left:<38} │ {right:>38}")
+        print("="*80)
+        print("F5 Copy  F6 Move  F10 Quit")
+        print(f"Left:  {real_path_to_virtual(left_path)}")
+        print(f"Right: {real_path_to_virtual(right_path)}")
+
+    show_panels()
+    while True:
+        cmd = input("mc> ").strip().lower()
+        if cmd in ('q', 'quit', 'f10', 'exit'):
+            break
+        elif cmd.startswith('cd '):
+            _, new_dir = cmd.split(maxsplit=1)
+            new = resolve_path(new_dir)
+            if os.path.isdir(new):
+                left_path = new
+        elif cmd == 'copy' or cmd == 'f5':
+            src = input("Source file: ")
+            dst = input("Destination: ")
+            try:
+                shutil.copy2(resolve_path(src), resolve_path(dst))
+                print("Copied.")
+            except Exception as e:
+                print(f"Error: {e}")
+        elif cmd == 'move' or cmd == 'f6':
+            src = input("Source file: ")
+            dst = input("Destination: ")
+            try:
+                shutil.move(resolve_path(src), resolve_path(dst))
+                print("Moved.")
+            except Exception as e:
+                print(f"Error: {e}")
+        else:
+            print("Commands: cd, copy, move, quit")
+        show_panels()
+
+def cmd_calc(args):
+    """Простой калькулятор."""
+    print("Калькулятор (введите выражение, 'exit' для выхода)")
+    while True:
+        try:
+            expr = input("calc> ")
+            if expr.lower() in ('exit', 'quit', 'q'):
+                break
+            result = eval(expr)
+            print(f"= {result}")
+        except Exception as e:
+            print(f"Ошибка: {e}")
+
+# ─── OTA-обновление (настоящее) ──────────────────────────────────
 def cmd_ota_update(args):
     print("══════════════════════════════════════")
     print("🔄 ЗАПУСК OTA ОБНОВЛЕНИЯ ARMBRIAN")
     print("══════════════════════════════════════")
     print("🔍 Проверка наличия обновлений...")
-    try:
-        with urllib.request.urlopen(VERSION_URL, timeout=5) as resp:
-            latest_version = resp.read().decode().strip()
-    except Exception as e:
-        print(f"❌ Не удалось проверить обновление: {e}")
+
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+
+    latest_version = None
+    for attempt in range(3):
+        try:
+            resp = session.get(VERSION_URL, timeout=15)
+            resp.raise_for_status()
+            latest_version = resp.text.strip()
+            break
+        except requests.exceptions.SSLError:
+            try:
+                resp = session.get(VERSION_URL, timeout=15, verify=False)
+                latest_version = resp.text.strip()
+                print("⚠️  SSL проверка отключена (небезопасно)")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"❌ Не удалось проверить версию: {e}")
+                    return
+        except requests.exceptions.ConnectionError as e:
+            if attempt == 2:
+                print(f"❌ Ошибка соединения: {e}")
+                return
+        except Exception as e:
+            if attempt == 2:
+                print(f"❌ Ошибка: {e}")
+                return
+        time.sleep(2)
+
+    if not latest_version:
         return
+
     print(f"   Текущая версия: {VERSION}")
     print(f"   Доступная версия: {latest_version}")
+
     if latest_version == VERSION:
         print("✅ У вас уже установлена последняя версия.")
         return
+
     confirm = input("Установить обновление? (y/N): ").strip().lower()
     if confirm != 'y':
         print("Обновление отменено.")
         return
+
     print("📥 Загрузка обновления...")
-    try:
-        with urllib.request.urlopen(UPDATE_URL, timeout=30) as resp:
-            new_code = resp.read()
-    except Exception as e:
-        print(f"❌ Ошибка загрузки: {e}")
-        return
     current_file = Path(__file__).resolve()
     backup_file = current_file.with_suffix(".py.bak")
+
+    new_code = None
+    for attempt in range(3):
+        try:
+            resp = session.get(UPDATE_URL, timeout=30, verify=True)
+            resp.raise_for_status()
+            new_code = resp.content
+            break
+        except requests.exceptions.SSLError:
+            try:
+                resp = session.get(UPDATE_URL, timeout=30, verify=False)
+                new_code = resp.content
+                print("⚠️  SSL проверка отключена при загрузке обновления")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"❌ Ошибка загрузки: {e}")
+        except Exception as e:
+            if attempt == 2:
+                print(f"❌ Ошибка загрузки: {e}")
+        time.sleep(2)
+
+    if new_code is None and os.name == 'nt':
+        print("⚠️  Попытка загрузки через PowerShell...")
+        try:
+            ps_cmd = f"powershell -Command \"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '{UPDATE_URL}' -OutFile '{backup_file}' -UseBasicParsing\""
+            subprocess.run(ps_cmd, shell=True, check=True)
+            with open(backup_file, "rb") as f:
+                new_code = f.read()
+        except Exception as e:
+            print(f"❌ Не удалось загрузить через PowerShell: {e}")
+
+    if new_code is None:
+        print("❌ Все способы загрузки не сработали.")
+        return
+
     shutil.copy2(current_file, backup_file)
     try:
         with open(current_file, "wb") as f:
@@ -652,6 +881,7 @@ def cmd_ota_update(args):
         print(f"❌ Ошибка записи: {e}")
         shutil.copy2(backup_file, current_file)
         return
+
     print("🔄 Перезапуск приложения...")
     if os.name == 'nt':
         subprocess.Popen([sys.executable] + sys.argv)
@@ -659,7 +889,7 @@ def cmd_ota_update(args):
     else:
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-# ─── Словарь команд ───────────────────────────────────────────────
+# ─── Словарь команд (полный) ─────────────────────────────────────
 commands = {
     "help": cmd_help,
     "man": cmd_man,
@@ -713,11 +943,22 @@ commands = {
     "systemctl": cmd_systemctl,
     "journalctl": cmd_journalctl,
     "timedatectl": cmd_timedatectl,
+    "de": cmd_de,
+    "desktop": cmd_de,
+    "startx": cmd_de,
+    "mc": cmd_mc,
+    "calc": cmd_calc,
     "ota-update": cmd_ota_update,
 }
 
 # ─── Главный цикл ─────────────────────────────────────────────────
 def main():
+    # Создаём базовые каталоги внутри песочницы
+    for d in ["home/armbian", "etc", "tmp", "bin", "usr", "var"]:
+        os.makedirs(os.path.join(SANDBOX, d), exist_ok=True)
+    armbian_home = os.path.join(SANDBOX, "home", "armbian")
+    change_dir(armbian_home)
+
     if readline is not None:
         readline.set_history_length(1000)
         histfile = os.path.join(os.path.expanduser("~"), ".armbian_webos_history")
@@ -727,8 +968,9 @@ def main():
             pass
 
     print("🛠️ Armbian 24.5.0 (ядро 5.15.93) — загрузка завершена.")
+    print("Реальная файловая система в песочнице:", SANDBOX)
     print("Добро пожаловать! Введите help для списка команд.")
-    print("Попробуйте: ota-update, apt update, nano readme.txt\n")
+    print("Попробуйте: de (рабочий стол), ota-update, apt update, nano readme.txt\n")
 
     while True:
         try:
