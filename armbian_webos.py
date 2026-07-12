@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Armbian WebOS Terminal — реальная ФС (песочница), OTA, apt, Desktop Environment.
+Полноэкранный рабочий стол и файловый менеджер.
 Кроссплатформенная (Windows / Linux / macOS).
 """
 
@@ -30,7 +31,7 @@ except ImportError:
         readline = None
         print("Предупреждение: история команд недоступна (установите pyreadline3 на Windows)")
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 USER = "armbian"
 HOSTNAME = "armbian-pc"
 
@@ -114,7 +115,7 @@ def cmd_help(args):
         "─── Пакеты ───", "apt update/upgrade/install", "dpkg", "armbian-config",
         "─── Обработка ───", "head", "tail", "wc", "sort", "uniq", "diff", "tar", "gzip",
         "─── Сервисы ───", "systemctl", "journalctl", "timedatectl",
-        "─── GUI ───", "de / desktop / startx — текстовый рабочий стол",
+        "─── GUI ───", "de / desktop / startx — полноэкранный рабочий стол",
         "               mc — файловый менеджер", "calc — калькулятор",
         "─── Обновление ───", "ota-update — реальное OTA обновление"
     ]
@@ -126,7 +127,7 @@ def cmd_man(args):
         "ls": "ls - список файлов и папок.",
         "nano": "nano - текстовый редактор.",
         "apt": "apt - менеджер пакетов (реальный через WSL).",
-        "de": "de / desktop / startx - текстовый рабочий стол с меню.",
+        "de": "de / desktop / startx - полноэкранный рабочий стол с меню.",
         "mc": "mc - двухпанельный файловый менеджер.",
         "ota-update": "ota-update - обновление скрипта.",
     }
@@ -637,118 +638,160 @@ def cmd_journalctl(args):
 def cmd_timedatectl(args):
     print(datetime.now().strftime("Local time: %a %Y-%m-%d %H:%M:%S %Z"))
 
-# ─── Псевдо‑рабочий стол и файловый менеджер ────────────────────
+# ─── Полноэкранный рабочий стол и файловый менеджер ─────────────
 def cmd_de(args):
-    """Текстовый рабочий стол с меню."""
-    print("\n" * 2)
-    print("╔══════════════════════════════════════════╗")
-    print("║        Armbian Desktop Environment       ║")
-    print("╠══════════════════════════════════════════╣")
-    print("║                                          ║")
-    print("║   📁 File Manager       (mc)            ║")
-    print("║   📝 Text Editor        (nano)          ║")
-    print("║   🧮 Calculator         (calc)          ║")
-    print("║   💻 Terminal           (back)          ║")
-    print("║   ⏻  Shutdown           (shutdown)      ║")
-    print("║                                          ║")
-    print("╚══════════════════════════════════════════╝")
-    print("\nИспользуйте стрелки ↑↓ и Enter для выбора, Esc для выхода")
+    """Полноэкранный текстовый рабочий стол с меню."""
+    # Вход в альтернативный буфер (только для Unix‑подобных)
+    if os.name != 'nt':
+        print("\033[?1049h", end="")
+        sys.stdout.flush()
+    else:
+        # На Windows пытаемся увеличить размер консоли
+        os.system('mode con cols=100 lines=30')
 
     items = [
-        ("File Manager", "mc"),
-        ("Text Editor", "nano "),
-        ("Calculator", "calc"),
-        ("Terminal", ""),
-        ("Shutdown", "shutdown"),
+        ("📁 File Manager", "mc"),
+        ("📝 Text Editor", "nano "),
+        ("🧮 Calculator", "calc"),
+        ("💻 Terminal", ""),
+        ("⏻  Shutdown", "shutdown"),
     ]
     current = 0
-    if os.name != 'nt':
-        import tty, termios
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while True:
+    running = True
+
+    try:
+        while running:
+            if os.name != 'nt':
                 sys.stdout.write("\033[2J\033[H")
-                print("╔══════════════════════════════════════════╗")
-                print("║        Armbian Desktop Environment       ║")
-                print("╠══════════════════════════════════════════╣")
-                print("║                                          ║")
-                for i, (label, _) in enumerate(items):
-                    if i == current:
-                        print(f"║  \033[7m {label:37} \033[0m  ║")
-                    else:
-                        print(f"║   {label:37}   ║")
-                print("║                                          ║")
-                print("╚══════════════════════════════════════════╝")
-                sys.stdout.flush()
-                key = sys.stdin.read(1)
-                if key == '\x1b':
-                    next1, next2 = sys.stdin.read(2)
-                    if next1 == '[':
-                        if next2 == 'A':
+            else:
+                os.system('cls')
+
+            # Отрисовка меню
+            width = 50
+            print("\n" * 4)
+            print(" " * ((100 - width) // 2) + "╔" + "═" * (width - 2) + "╗")
+            print(" " * ((100 - width) // 2) + "║" + " Armbian Desktop Environment".center(width - 2) + "║")
+            print(" " * ((100 - width) // 2) + "╠" + "═" * (width - 2) + "╣")
+            print(" " * ((100 - width) // 2) + "║" + " " * (width - 2) + "║")
+            for i, (label, _) in enumerate(items):
+                text = f" {label} "
+                if i == current:
+                    line = "\033[7m" + text.center(width - 2) + "\033[0m"
+                else:
+                    line = text.center(width - 2)
+                print(" " * ((100 - width) // 2) + "║" + line + "║")
+            print(" " * ((100 - width) // 2) + "║" + " " * (width - 2) + "║")
+            print(" " * ((100 - width) // 2) + "╚" + "═" * (width - 2) + "╝")
+            print("\n" + " " * ((100 - width) // 2) + "↑↓: выбор   Enter: запуск   Esc: выход")
+            sys.stdout.flush()
+
+            if os.name != 'nt':
+                import tty, termios
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                try:
+                    tty.setraw(fd)
+                    key = sys.stdin.read(1)
+                    if key == '\x1b':
+                        seq = sys.stdin.read(2)
+                        if seq == '[A':
                             current = (current - 1) % len(items)
-                        elif next2 == 'B':
+                        elif seq == '[B':
                             current = (current + 1) % len(items)
-                elif key == '\r':
+                        else:  # просто Esc
+                            running = False
+                    elif key == '\r':
+                        chosen_cmd = items[current][1]
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        if chosen_cmd:
+                            if os.name != 'nt':
+                                print("\033[?1049l", end="")
+                                sys.stdout.flush()
+                            if chosen_cmd == "shutdown":
+                                cmd_shutdown([])
+                            elif chosen_cmd == "mc":
+                                cmd_mc([])
+                            else:
+                                if chosen_cmd == "nano ":
+                                    filename = input("Введите имя файла: ")
+                                    cmd_nano([filename])
+                                elif chosen_cmd == "calc":
+                                    cmd_calc([])
+                        running = False
+                finally:
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    chosen_cmd = items[current][1]
-                    if chosen_cmd:
+            else:
+                # Упрощённый ввод для Windows
+                choice = input("Выберите номер (1-5) или q для выхода: ").strip().lower()
+                if choice == 'q':
+                    running = False
+                elif choice.isdigit():
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(items):
+                        current = idx
+                        chosen_cmd = items[current][1]
                         if chosen_cmd == "shutdown":
                             cmd_shutdown([])
                         elif chosen_cmd == "mc":
                             cmd_mc([])
-                        else:
-                            if chosen_cmd == "nano ":
-                                filename = input("Введите имя файла: ")
-                                cmd_nano([filename])
-                            elif chosen_cmd == "calc":
-                                cmd_calc([])
-                    break
-                elif key == '\x1b':
-                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                    break
-        except:
-            pass
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            print("\nРабочий стол закрыт.")
-    else:
-        print("\n(Интерактивное меню недоступно на Windows без дополнительных модулей)")
-        print("Выполните 'mc', 'nano <file>', 'calc' или 'shutdown' вручную.")
+                        elif chosen_cmd == "nano ":
+                            filename = input("Введите имя файла: ")
+                            cmd_nano([filename])
+                        elif chosen_cmd == "calc":
+                            cmd_calc([])
+                        running = False
+    finally:
+        if os.name != 'nt':
+            print("\033[?1049l", end="")
+            sys.stdout.flush()
+        print("Рабочий стол закрыт.")
 
 def cmd_mc(args):
-    """Простой двухпанельный файловый менеджер (упрощённый)."""
+    """Полноэкранный двухпанельный файловый менеджер."""
+    if os.name != 'nt':
+        print("\033[?1049h", end="")
+        sys.stdout.flush()
     left_path = get_cwd_real()
     right_path = get_cwd_real()
 
     def show_panels():
-        print("\n" + "="*80)
-        print(f"{'Left':<38} │ {'Right':>38}")
-        print("="*80)
+        if os.name != 'nt':
+            sys.stdout.write("\033[2J\033[H")
+        else:
+            os.system('cls')
+        print("=" * 100)
+        print(f"{'Left':<48} │ {'Right':>48}")
+        print("=" * 100)
         left_items = os.listdir(left_path) if os.path.isdir(left_path) else []
         right_items = os.listdir(right_path) if os.path.isdir(right_path) else []
-        max_lines = max(len(left_items), len(right_items), 20)
+        max_lines = 25
         for i in range(max_lines):
             left = left_items[i] if i < len(left_items) else ""
             right = right_items[i] if i < len(right_items) else ""
-            print(f"{left:<38} │ {right:>38}")
-        print("="*80)
-        print("F5 Copy  F6 Move  F10 Quit")
+            print(f"{left:<48} │ {right:>48}")
+        print("=" * 100)
+        print("F5 Copy  F6 Move  F10/Quit  TAB switch panel  cd <dir>")
         print(f"Left:  {real_path_to_virtual(left_path)}")
         print(f"Right: {real_path_to_virtual(right_path)}")
+        sys.stdout.flush()
 
     show_panels()
+    active_panel = 'left'
     while True:
         cmd = input("mc> ").strip().lower()
         if cmd in ('q', 'quit', 'f10', 'exit'):
             break
+        elif cmd == 'tab':
+            active_panel = 'right' if active_panel == 'left' else 'left'
         elif cmd.startswith('cd '):
             _, new_dir = cmd.split(maxsplit=1)
             new = resolve_path(new_dir)
             if os.path.isdir(new):
-                left_path = new
-        elif cmd == 'copy' or cmd == 'f5':
+                if active_panel == 'left':
+                    left_path = new
+                else:
+                    right_path = new
+        elif cmd in ('copy', 'f5'):
             src = input("Source file: ")
             dst = input("Destination: ")
             try:
@@ -756,7 +799,7 @@ def cmd_mc(args):
                 print("Copied.")
             except Exception as e:
                 print(f"Error: {e}")
-        elif cmd == 'move' or cmd == 'f6':
+        elif cmd in ('move', 'f6'):
             src = input("Source file: ")
             dst = input("Destination: ")
             try:
@@ -765,8 +808,12 @@ def cmd_mc(args):
             except Exception as e:
                 print(f"Error: {e}")
         else:
-            print("Commands: cd, copy, move, quit")
+            print("Commands: cd, copy, move, quit, tab")
         show_panels()
+
+    if os.name != 'nt':
+        print("\033[?1049l", end="")
+        sys.stdout.flush()
 
 def cmd_calc(args):
     """Простой калькулятор."""
