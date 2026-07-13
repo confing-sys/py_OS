@@ -9,7 +9,7 @@ git clone https://github.com/confing-sys/py_OS
 cd armbian-webos
 python armbian_webos.py
 ```
-# если у вас windows установите
+# если у вас windows выполните код ниже а потом код выше
 ```bash
 pip install requests
 pip install pyreadline3
