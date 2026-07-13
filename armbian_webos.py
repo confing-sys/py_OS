@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Armbian WebOS Terminal — реальная ФС, OTA, apt, Desktop Environment, C/C++ compiler,
-менеджер пакетов .pyos.
+менеджер пакетов .pyos, алиасы команд.
 Кроссплатформенная (Windows / Linux / macOS).
 """
 
@@ -34,7 +34,7 @@ except ImportError:
         readline = None
         print("Предупреждение: история команд недоступна (установите pyreadline3 на Windows)")
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 USER = "armbian"
 HOSTNAME = "armbian-pc"
 
@@ -48,6 +48,41 @@ cwd_real = [SANDBOX]  # текущий путь внутри песочницы 
 
 # ─── База данных установленных .pyos пакетов ─────────────────────
 PACKAGES_DB = os.path.join(SANDBOX, "var", "lib", "pyos", "packages.json")
+
+# ─── Алиасы (глобальный словарь) ─────────────────────────────────
+aliases = {}
+
+def load_aliases():
+    """Загружает алиасы из ~/.bashrc внутри песочницы."""
+    global aliases
+    aliases = {}
+    bashrc = os.path.join(SANDBOX, "home", "armbian", ".bashrc")
+    if os.path.isfile(bashrc):
+        with open(bashrc, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("alias "):
+                    # формат: alias name='command' или alias name="command"
+                    parts = line[6:].split("=", 1)
+                    if len(parts) == 2:
+                        name = parts[0].strip()
+                        command = parts[1].strip().strip("'\"")
+                        aliases[name] = command
+
+def save_aliases():
+    """Сохраняет алиасы в ~/.bashrc (перезаписывает строки алиасов)."""
+    bashrc = os.path.join(SANDBOX, "home", "armbian", ".bashrc")
+    lines = []
+    if os.path.isfile(bashrc):
+        with open(bashrc, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    # Удаляем старые alias строки
+    new_lines = [line for line in lines if not line.strip().startswith("alias ")]
+    # Добавляем текущие алиасы
+    for name, cmd in aliases.items():
+        new_lines.append(f"alias {name}='{cmd}'\n")
+    with open(bashrc, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
 
 def load_pkg_db():
     if os.path.exists(PACKAGES_DB):
@@ -162,6 +197,7 @@ def cmd_help(args):
         "help", "man <cmd>", "ls [-la]", "cd", "pwd", "cat", "touch", "mkdir", "rm [-r]",
         "cp", "mv", "echo", "grep", "chmod", "whoami", "hostname", "date", "cal",
         "uname", "clear", "history", "nano", "exit", "shutdown",
+        "─── Алиасы ───", "alias [имя='команда'] — создать/посмотреть алиасы",
         "─── Сеть ───", "ifconfig", "ping", "netstat", "nslookup", "wget", "curl",
         "─── Система ───", "top", "ps", "kill", "df", "free", "lsblk", "uptime", "dmesg",
         "─── Пакеты ───", "apt update/upgrade/install", "dpkg", "armbian-config",
@@ -191,6 +227,7 @@ def cmd_man(args):
         "make": "make - утилита сборки (требуется WSL и make)",
         "build": "build <файл> - скомпилировать один C-файл",
         "pkg": "pkg install|remove|list — менеджер пакетов .pyos",
+        "alias": "alias [name='command'] — создать алиас, alias без аргументов — показать все",
         "ota-update": "ota-update - обновление скрипта.",
     }
     cmd = args[0] if args else ""
@@ -755,6 +792,37 @@ def cmd_pkg(args):
     else:
         print(f"pkg: неизвестная подкоманда '{sub}'")
 
+# ─── Алиасы ─────────────────────────────────────────────────────
+def cmd_alias(args):
+    """Управление алиасами: alias name='cmd', alias name, alias (без аргументов)."""
+    if not args:
+        # Показать все алиасы
+        if not aliases:
+            print("Нет заданных алиасов.")
+        else:
+            for name, cmd in aliases.items():
+                print(f"alias {name}='{cmd}'")
+        return
+    # Может быть 'name=cmd' или просто 'name'
+    first = args[0]
+    if '=' in first:
+        # задание алиаса
+        try:
+            name, cmd_part = first.split('=', 1)
+            name = name.strip()
+            cmd_part = cmd_part.strip().strip("'\"")
+            aliases[name] = cmd_part
+            save_aliases()
+            print(f"Алиас '{name}' установлен: {cmd_part}")
+        except:
+            print("Ошибка синтаксиса. Используйте: alias name='команда'")
+    else:
+        # показать конкретный алиас
+        if first in aliases:
+            print(f"alias {first}='{aliases[first]}'")
+        else:
+            print(f"Алиас '{first}' не найден.")
+
 # ─── OTA-обновление (улучшенное: requests + PowerShell) ─────────
 def download_text(url, timeout=15):
     try:
@@ -850,15 +918,18 @@ commands = {
     "systemctl": cmd_systemctl, "journalctl": cmd_journalctl, "timedatectl": cmd_timedatectl,
     "de": cmd_de, "desktop": cmd_de, "startx": cmd_de, "mc": cmd_mc, "calc": cmd_calc,
     "gcc": cmd_gcc, "g++": cmd_gpp, "make": cmd_make_cmd, "build": cmd_build,
-    "pkg": cmd_pkg,
+    "pkg": cmd_pkg, "alias": cmd_alias,
     "ota-update": cmd_ota_update,
 }
 
-# ─── Главный цикл ─────────────────────────────────────────────────
+# ─── Главный цикл (с поддержкой алиасов) ─────────────────────────
 def main():
     for d in ["home/armbian", "etc", "tmp", "bin", "usr", "var"]:
         os.makedirs(os.path.join(SANDBOX, d), exist_ok=True)
     change_dir(os.path.join(SANDBOX, "home", "armbian"))
+
+    # Загружаем алиасы из .bashrc
+    load_aliases()
 
     if readline is not None:
         readline.set_history_length(1000)
@@ -869,7 +940,7 @@ def main():
     print("🛠️ Armbian 24.5.0 (ядро 5.15.93) — загрузка завершена.")
     print("Реальная файловая система в песочнице:", SANDBOX)
     print("Добро пожаловать! Введите help для списка команд.")
-    print("Попробуйте: de (рабочий стол), ota-update, apt update, nano readme.txt\n")
+    print("Попробуйте: alias ll='ls -la', ll, de, ota-update, apt update\n")
 
     while True:
         try:
@@ -890,6 +961,24 @@ def main():
         if current: parts.append(current)
         cmd = parts[0]
         args = parts[1:]
+
+        # Проверяем алиас
+        if cmd in aliases:
+            alias_cmd = aliases[cmd]
+            # Подставляем алиас вместо команды, аргументы передаются как есть
+            # Для простоты: если алиас содержит пробелы, считаем что это полная команда, 
+            # иначе просто заменяем имя команды
+            if ' ' in alias_cmd:
+                # Заменяем всю строку: алиас + оставшиеся аргументы
+                new_parts = alias_cmd.split() + args
+                cmd = new_parts[0]
+                args = new_parts[1:]
+            else:
+                # Просто заменяем имя команды
+                cmd = alias_cmd
+                # args остаются те же
+            # Теперь обрабатываем команду как обычно
+
         if cmd in commands:
             try: commands[cmd](args)
             except Exception as e: print(f"Ошибка выполнения команды: {e}")
