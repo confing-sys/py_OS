@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Armbian WebOS Terminal — реальная ФС, OTA, apt, Desktop Environment, C/C++ compiler,
-менеджер пакетов .pyos, алиасы команд.
+менеджер пакетов .pyos с авто-алиасами (запуск без WSL).
 Кроссплатформенная (Windows / Linux / macOS).
 """
 
@@ -14,6 +14,7 @@ import ssl
 import tempfile
 import zipfile
 import json
+import shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -34,7 +35,7 @@ except ImportError:
         readline = None
         print("Предупреждение: история команд недоступна (установите pyreadline3 на Windows)")
 
-VERSION = "1.7.0"
+VERSION = "2.0.0"
 USER = "armbian"
 HOSTNAME = "armbian-pc"
 
@@ -226,7 +227,7 @@ def cmd_man(args):
         "g++": "g++ - компилятор C++ (требуется WSL и установленный g++)",
         "make": "make - утилита сборки (требуется WSL и make)",
         "build": "build <файл> - скомпилировать один C-файл",
-        "pkg": "pkg install|remove|list — менеджер пакетов .pyos",
+        "pkg": "pkg install|remove|list — менеджер пакетов .pyos (авто-алиасы без WSL)",
         "alias": "alias [name='command'] — создать алиас, alias без аргументов — показать все",
         "ota-update": "ota-update - обновление скрипта.",
     }
@@ -681,14 +682,14 @@ def cmd_build(args):
     out = os.path.splitext(os.path.basename(src))[0] + ".out"
     run_wsl_command("gcc", [src, "-o", out])
 
-# ─── Менеджер пакетов .pyos ─────────────────────────────────────
+# ─── Менеджер пакетов .pyos (запуск без WSL) ────────────────────
 def cmd_pkg_install(args):
     if not args:
         print("pkg install: укажите .pyos файл")
         return
-    filename = args[0]
+    filename = resolve_path(args[0])
     if not os.path.exists(filename):
-        print(f"Файл {filename} не найден")
+        print(f"Файл {args[0]} не найден")
         return
     try:
         with zipfile.ZipFile(filename, 'r') as zf:
@@ -738,13 +739,42 @@ def cmd_pkg_install(args):
                     out.write(zf.read(src_name))
                 installed_files.append(target_rel)
                 print(f"  Установлен {target_rel}")
+
+            # Секция bin: создаём алиасы для запуска без WSL
+            bin_map = meta.get('bin', {})
+            aliases_created = []
+            for cmd_name, bin_path in bin_map.items():
+                full_bin_path = os.path.join(SANDBOX, bin_path.lstrip('/'))
+                if not os.path.exists(full_bin_path):
+                    print(f"Предупреждение: исполняемый файл {bin_path} не найден, алиас {cmd_name} не создан.")
+                    continue
+                # Выбираем способ запуска в зависимости от расширения
+                if bin_path.endswith('.py'):
+                    # Запускаем тем же Python, что и основная программа
+                    cmd_alias = f'"{sys.executable}" "{full_bin_path}"'
+                elif bin_path.endswith(('.exe', '.bat', '.cmd')):
+                    # Прямой запуск исполняемых файлов
+                    cmd_alias = f'"{full_bin_path}"'
+                else:
+                    # Для остальных (например, .sh) – пытаемся выполнить через cmd /c
+                    cmd_alias = f'"{full_bin_path}"'
+                aliases[cmd_name] = cmd_alias
+                aliases_created.append(cmd_name)
+                print(f"  Алиас создан: {cmd_name} -> {cmd_alias}")
+
+            if aliases_created:
+                save_aliases()
+
             db[pkg_name] = {
                 'version': pkg_version,
                 'files': installed_files,
+                'aliases': aliases_created,
                 'description': meta.get('description', '')
             }
             save_pkg_db(db)
             print(f"Пакет {pkg_name} {pkg_version} успешно установлен.")
+            if aliases_created:
+                print("Теперь вы можете запускать установленные программы по их алиасам.")
     except zipfile.BadZipFile:
         print("Ошибка: повреждённый архив")
     except Exception as e:
@@ -766,6 +796,15 @@ def cmd_pkg_remove(args):
         if os.path.isfile(f_abs):
             os.remove(f_abs)
             print(f"  Удалён {f_rel}")
+
+    aliases_created = info.get('aliases', [])
+    for alias_name in aliases_created:
+        if alias_name in aliases:
+            del aliases[alias_name]
+            print(f"  Алиас {alias_name} удалён")
+    if aliases_created:
+        save_aliases()
+
     del db[pkg_name]
     save_pkg_db(db)
     print(f"Пакет {pkg_name} удалён.")
@@ -777,6 +816,8 @@ def cmd_pkg_list(args):
         return
     for name, info in db.items():
         print(f"{name} {info.get('version','?')} - {info.get('description','')}")
+        if info.get('aliases'):
+            print("   Алиасы: " + ", ".join(info['aliases']))
 
 def cmd_pkg(args):
     if not args:
@@ -794,19 +835,15 @@ def cmd_pkg(args):
 
 # ─── Алиасы ─────────────────────────────────────────────────────
 def cmd_alias(args):
-    """Управление алиасами: alias name='cmd', alias name, alias (без аргументов)."""
     if not args:
-        # Показать все алиасы
         if not aliases:
             print("Нет заданных алиасов.")
         else:
             for name, cmd in aliases.items():
                 print(f"alias {name}='{cmd}'")
         return
-    # Может быть 'name=cmd' или просто 'name'
     first = args[0]
     if '=' in first:
-        # задание алиаса
         try:
             name, cmd_part = first.split('=', 1)
             name = name.strip()
@@ -817,7 +854,6 @@ def cmd_alias(args):
         except:
             print("Ошибка синтаксиса. Используйте: alias name='команда'")
     else:
-        # показать конкретный алиас
         if first in aliases:
             print(f"alias {first}='{aliases[first]}'")
         else:
@@ -922,13 +958,12 @@ commands = {
     "ota-update": cmd_ota_update,
 }
 
-# ─── Главный цикл (с поддержкой алиасов) ─────────────────────────
+# ─── Главный цикл (алиасы обрабатываются через shlex) ────────────
 def main():
     for d in ["home/armbian", "etc", "tmp", "bin", "usr", "var"]:
         os.makedirs(os.path.join(SANDBOX, d), exist_ok=True)
     change_dir(os.path.join(SANDBOX, "home", "armbian"))
 
-    # Загружаем алиасы из .bashrc
     load_aliases()
 
     if readline is not None:
@@ -949,51 +984,50 @@ def main():
             print("\nИспользуйте 'exit' для выхода")
             continue
         if not line.strip(): continue
-        parts = []
-        current = ""
-        in_quotes = False
-        for ch in line:
-            if ch == '"':
-                in_quotes = not in_quotes
-            elif ch == ' ' and not in_quotes:
-                if current: parts.append(current); current = ""
-            else: current += ch
-        if current: parts.append(current)
+
+        # Разбор строки с учётом кавычек
+        parts = shlex.split(line)
+        if not parts:
+            continue
         cmd = parts[0]
         args = parts[1:]
 
         # Проверяем алиас
         if cmd in aliases:
             alias_cmd = aliases[cmd]
-            # Подставляем алиас вместо команды, аргументы передаются как есть
-            # Для простоты: если алиас содержит пробелы, считаем что это полная команда, 
-            # иначе просто заменяем имя команды
-            if ' ' in alias_cmd:
-                # Заменяем всю строку: алиас + оставшиеся аргументы
-                new_parts = alias_cmd.split() + args
-                cmd = new_parts[0]
-                args = new_parts[1:]
+            # Разбираем алиас-строку (может содержать кавычки и пробелы)
+            alias_parts = shlex.split(alias_cmd)
+            # Добавляем оставшиеся аргументы, введённые пользователем
+            full_parts = alias_parts + args
+            if full_parts:
+                cmd = full_parts[0]
+                args = full_parts[1:]
             else:
-                # Просто заменяем имя команды
-                cmd = alias_cmd
-                # args остаются те же
-            # Теперь обрабатываем команду как обычно
+                continue
 
         if cmd in commands:
-            try: commands[cmd](args)
-            except Exception as e: print(f"Ошибка выполнения команды: {e}")
+            try:
+                commands[cmd](args)
+            except Exception as e:
+                print(f"Ошибка выполнения команды: {e}")
         else:
-            if os.name == 'nt':
-                wsl = shutil.which("wsl")
-                if wsl:
-                    try: subprocess.run(["wsl"] + [cmd] + args, check=False)
-                    except Exception as e: print(f"Не удалось запустить '{cmd}' через WSL: {e}")
-                else: print(f"{cmd}: команда не найдена (WSL не установлен)")
-            elif os.name == 'posix':
-                try: subprocess.run([cmd] + args, check=False)
-                except FileNotFoundError: print(f"{cmd}: команда не найдена")
-                except Exception as e: print(f"Ошибка выполнения '{cmd}': {e}")
-            else: print(f"{cmd}: команда не найдена")
+            # Пытаемся выполнить как внешнюю программу
+            try:
+                subprocess.run([cmd] + args, shell=False, check=False)
+            except FileNotFoundError:
+                if os.name == 'nt':
+                    wsl = shutil.which("wsl")
+                    if wsl:
+                        try:
+                            subprocess.run(["wsl"] + [cmd] + args, check=False)
+                        except Exception:
+                            print(f"{cmd}: команда не найдена")
+                    else:
+                        print(f"{cmd}: команда не найдена")
+                else:
+                    print(f"{cmd}: команда не найдена")
+            except Exception as e:
+                print(f"Ошибка выполнения '{cmd}': {e}")
 
     if readline is not None:
         try: readline.write_history_file(histfile)
