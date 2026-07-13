@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Armbian WebOS Terminal — реальная ФС (песочница), OTA, apt, Desktop Environment,
-C/C++ compiler, fallback к любым WSL-программам.
+Armbian WebOS Terminal — реальная ФС, OTA, apt, Desktop Environment, C/C++ compiler,
+менеджер пакетов .pyos.
 Кроссплатформенная (Windows / Linux / macOS).
 """
 
@@ -12,6 +12,8 @@ import subprocess
 import time
 import ssl
 import tempfile
+import zipfile
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -32,7 +34,7 @@ except ImportError:
         readline = None
         print("Предупреждение: история команд недоступна (установите pyreadline3 на Windows)")
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 USER = "armbian"
 HOSTNAME = "armbian-pc"
 
@@ -43,6 +45,20 @@ VERSION_URL = "https://raw.githubusercontent.com/confing-sys/py_OS/main/version.
 SANDBOX = os.path.join(os.path.expanduser("~"), "armbian_os")
 os.makedirs(SANDBOX, exist_ok=True)
 cwd_real = [SANDBOX]  # текущий путь внутри песочницы (список)
+
+# ─── База данных установленных .pyos пакетов ─────────────────────
+PACKAGES_DB = os.path.join(SANDBOX, "var", "lib", "pyos", "packages.json")
+
+def load_pkg_db():
+    if os.path.exists(PACKAGES_DB):
+        with open(PACKAGES_DB, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_pkg_db(db):
+    os.makedirs(os.path.dirname(PACKAGES_DB), exist_ok=True)
+    with open(PACKAGES_DB, 'w') as f:
+        json.dump(db, f, indent=2)
 
 # ─── Вспомогательные функции для реальной ФС ─────────────────────
 def get_real_path(path_list):
@@ -149,6 +165,7 @@ def cmd_help(args):
         "─── Сеть ───", "ifconfig", "ping", "netstat", "nslookup", "wget", "curl",
         "─── Система ───", "top", "ps", "kill", "df", "free", "lsblk", "uptime", "dmesg",
         "─── Пакеты ───", "apt update/upgrade/install", "dpkg", "armbian-config",
+        "─── Пакеты .pyos ───", "pkg install <файл.pyos>", "pkg remove <имя>", "pkg list",
         "─── Обработка ───", "head", "tail", "wc", "sort", "uniq", "diff", "tar", "gzip",
         "─── Сервисы ───", "systemctl", "journalctl", "timedatectl",
         "─── GUI ───", "de / desktop / startx — полноэкранный рабочий стол",
@@ -173,6 +190,7 @@ def cmd_man(args):
         "g++": "g++ - компилятор C++ (требуется WSL и установленный g++)",
         "make": "make - утилита сборки (требуется WSL и make)",
         "build": "build <файл> - скомпилировать один C-файл",
+        "pkg": "pkg install|remove|list — менеджер пакетов .pyos",
         "ota-update": "ota-update - обновление скрипта.",
     }
     cmd = args[0] if args else ""
@@ -626,6 +644,117 @@ def cmd_build(args):
     out = os.path.splitext(os.path.basename(src))[0] + ".out"
     run_wsl_command("gcc", [src, "-o", out])
 
+# ─── Менеджер пакетов .pyos ─────────────────────────────────────
+def cmd_pkg_install(args):
+    if not args:
+        print("pkg install: укажите .pyos файл")
+        return
+    filename = args[0]
+    if not os.path.exists(filename):
+        print(f"Файл {filename} не найден")
+        return
+    try:
+        with zipfile.ZipFile(filename, 'r') as zf:
+            if 'meta.json' not in zf.namelist():
+                print("Ошибка: отсутствует meta.json в пакете")
+                return
+            meta = json.loads(zf.read('meta.json').decode('utf-8'))
+            pkg_name = meta.get('name')
+            pkg_version = meta.get('version')
+            if not pkg_name:
+                print("Ошибка: не указано имя пакета")
+                return
+            db = load_pkg_db()
+            if pkg_name in db:
+                print(f"Пакет {pkg_name} уже установлен (версия {db[pkg_name].get('version', '?')}). Удалите сначала.")
+                return
+            files_map = meta.get('files', {})
+            if not files_map:
+                print("Пакет не содержит файлов")
+                return
+            conflicts = []
+            for target_rel, src_name in files_map.items():
+                target_abs = os.path.join(SANDBOX, target_rel.lstrip('/'))
+                if os.path.exists(target_abs):
+                    owner = None
+                    for name, info in db.items():
+                        if target_rel in info.get('files', []):
+                            owner = name
+                            break
+                    if owner:
+                        conflicts.append(f"{target_rel} (принадлежит {owner})")
+                    else:
+                        conflicts.append(f"{target_rel} (неотслеживаемый файл)")
+            if conflicts:
+                print("Обнаружены конфликты:")
+                for c in conflicts:
+                    print(f"  - {c}")
+                ans = input("Продолжить установку? (y/N): ").strip().lower()
+                if ans != 'y':
+                    print("Установка отменена.")
+                    return
+            installed_files = []
+            for target_rel, src_name in files_map.items():
+                target_abs = os.path.join(SANDBOX, target_rel.lstrip('/'))
+                os.makedirs(os.path.dirname(target_abs), exist_ok=True)
+                with open(target_abs, 'wb') as out:
+                    out.write(zf.read(src_name))
+                installed_files.append(target_rel)
+                print(f"  Установлен {target_rel}")
+            db[pkg_name] = {
+                'version': pkg_version,
+                'files': installed_files,
+                'description': meta.get('description', '')
+            }
+            save_pkg_db(db)
+            print(f"Пакет {pkg_name} {pkg_version} успешно установлен.")
+    except zipfile.BadZipFile:
+        print("Ошибка: повреждённый архив")
+    except Exception as e:
+        print(f"Ошибка установки: {e}")
+
+def cmd_pkg_remove(args):
+    if not args:
+        print("pkg remove: укажите имя пакета")
+        return
+    pkg_name = args[0]
+    db = load_pkg_db()
+    if pkg_name not in db:
+        print(f"Пакет {pkg_name} не установлен")
+        return
+    info = db[pkg_name]
+    files = info.get('files', [])
+    for f_rel in files:
+        f_abs = os.path.join(SANDBOX, f_rel.lstrip('/'))
+        if os.path.isfile(f_abs):
+            os.remove(f_abs)
+            print(f"  Удалён {f_rel}")
+    del db[pkg_name]
+    save_pkg_db(db)
+    print(f"Пакет {pkg_name} удалён.")
+
+def cmd_pkg_list(args):
+    db = load_pkg_db()
+    if not db:
+        print("Нет установленных пакетов.")
+        return
+    for name, info in db.items():
+        print(f"{name} {info.get('version','?')} - {info.get('description','')}")
+
+def cmd_pkg(args):
+    if not args:
+        print("pkg: install|remove|list")
+        return
+    sub = args[0]
+    if sub == "install":
+        cmd_pkg_install(args[1:])
+    elif sub == "remove":
+        cmd_pkg_remove(args[1:])
+    elif sub == "list":
+        cmd_pkg_list(args[1:])
+    else:
+        print(f"pkg: неизвестная подкоманда '{sub}'")
+
 # ─── OTA-обновление (улучшенное: requests + PowerShell) ─────────
 def download_text(url, timeout=15):
     try:
@@ -721,6 +850,7 @@ commands = {
     "systemctl": cmd_systemctl, "journalctl": cmd_journalctl, "timedatectl": cmd_timedatectl,
     "de": cmd_de, "desktop": cmd_de, "startx": cmd_de, "mc": cmd_mc, "calc": cmd_calc,
     "gcc": cmd_gcc, "g++": cmd_gpp, "make": cmd_make_cmd, "build": cmd_build,
+    "pkg": cmd_pkg,
     "ota-update": cmd_ota_update,
 }
 
@@ -764,7 +894,6 @@ def main():
             try: commands[cmd](args)
             except Exception as e: print(f"Ошибка выполнения команды: {e}")
         else:
-            # Пытаемся выполнить команду через WSL (Windows) или напрямую (Linux)
             if os.name == 'nt':
                 wsl = shutil.which("wsl")
                 if wsl:
